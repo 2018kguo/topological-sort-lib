@@ -286,7 +286,28 @@ mod test {
     use super::ParentDependencyType;
     use super::TopologicalSorter;
     use std::error::Error;
+    use std::hash::Hash;
+    use std::hash::Hasher;
     type TestResult = Result<(), Box<dyn Error>>;
+
+    struct GenericNodeType {
+        unique_id: u64,
+        owned_data: Vec<String>,
+    }
+
+    impl PartialEq for GenericNodeType {
+        fn eq(&self, other: &Self) -> bool {
+            self.unique_id == other.unique_id
+        }
+    }
+
+    impl Eq for GenericNodeType {}
+
+    impl Hash for GenericNodeType {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.unique_id.hash(state);
+        }
+    }
 
     #[test]
     fn test_insert() -> TestResult {
@@ -433,6 +454,33 @@ mod test {
         assert!(peeked_nodes.len() == 2);
         assert!(peeked_nodes.contains(&&"any_parent"));
         assert!(peeked_nodes.contains(&&"all_parent"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_using_generic_node_type() -> TestResult {
+        let parent_node = GenericNodeType {
+            unique_id: 123, // Assign a u64 value to unique_id
+            owned_data: vec!["String1".to_string(), "String2".to_string()], // Create a vector of strings
+        };
+        let child_node = GenericNodeType {
+            unique_id: 456, // Assign a u64 value to unique_id
+            owned_data: vec!["String3".to_string(), "String4".to_string()], // Create a vector of strings
+        };
+
+        let mut sorter = TopologicalSorter::new();
+        let parent = sorter.insert(parent_node, ParentDependencyType::Any)?;
+        let child = sorter.insert(child_node, ParentDependencyType::All)?;
+
+        sorter.add_dependencies(parent, &vec![child])?;
+        sorter.prepare()?;
+        let mut ready_nodes = sorter.collect_ready_nodes()?;
+        assert!(ready_nodes.len() == 1);
+
+        let new_data = "Inserted".to_string();
+        for node in ready_nodes.iter_mut() {
+            node.owned_data.push(new_data.clone());
+        }
         Ok(())
     }
 }

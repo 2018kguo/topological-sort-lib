@@ -3,6 +3,7 @@
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hash::{Hash, Hasher};
 
 // Implementation goals:
@@ -34,11 +35,11 @@ enum NodeStatus {
 }
 
 // TODO use this later
-pub enum GraphConstraint {
-    SingleParentOnly,
-    MultipleParentsAllowed,
-    IsolatedNodesAllowed,
-}
+// pub enum GraphConstraint {
+//     SingleParentOnly,
+//     MultipleParentsAllowed,
+//     IsolatedNodesAllowed,
+// }
 
 // TODO: maybe make this generic over the hash type, would probably need a derive macro
 // TODO: store references to the nodes instead of the nodes themselves?
@@ -52,6 +53,27 @@ struct TopologicalSorter<NodeType> {
     node_parent_dependency_types: HashMap<u64, ParentDependencyType>,
     prepared_state: PreparedState,
 }
+
+#[derive(Debug)]
+enum VisitError {
+    SorterNotPrepared,
+    NodeNotAdded,
+    NodeNotReady,
+    NodeAlreadyVisited,
+}
+
+impl fmt::Display for VisitError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            VisitError::SorterNotPrepared => write!(f, "Sorter not prepared"),
+            VisitError::NodeNotAdded => write!(f, "Node not added"),
+            VisitError::NodeNotReady => write!(f, "Node not ready"),
+            VisitError::NodeAlreadyVisited => write!(f, "Node already visited"),
+        }
+    }
+}
+
+impl std::error::Error for VisitError {}
 
 impl<T> TopologicalSorter<T>
 where
@@ -143,9 +165,9 @@ where
     fn prepare_impl(&mut self) -> Result<()> {
         // TODO: update this validation based on graph constraints later
         // if there are multiple nodes with no parents, then error
-        if self.parent_dependencies.len() != (self.map.len() - 1) {
-            return Err(anyhow::anyhow!("There are multiple nodes with no parents"));
-        }
+        // if self.parent_dependencies.len() != (self.map.len() - 1) {
+        //     return Err(anyhow::anyhow!("There are multiple nodes with no parents"));
+        // }
 
         // if there are cycles, then error
         Self::find_cycle(&self.parent_dependencies, &self.child_dependencies)?;
@@ -204,20 +226,21 @@ where
         Ok(ready_nodes)
     }
 
-    fn mark_node_as_visited(&mut self, node: &T) -> Result<u64> {
+    fn mark_node_as_visited(&mut self, node: &T) -> std::result::Result<u64, VisitError> {
         if !(self.prepared_state == PreparedState::Prepared) {
-            return Err(anyhow::anyhow!("Not prepared"));
+            return Err(VisitError::SorterNotPrepared);
         }
         let hash = Self::hash(self, &node);
         if !self.node_statuses.contains_key(&hash) {
-            return Err(anyhow::anyhow!(
-                "This node has not been added to the sorter"
-            ));
+            return Err(VisitError::NodeNotAdded);
         }
         if !self.ready_node_hashes.contains(&hash)
             && !(self.node_statuses.get(&hash).unwrap() == &NodeStatus::Collected)
         {
-            return Err(anyhow::anyhow!("Node is not ready to be marked as visited"));
+            return Err(VisitError::NodeNotReady);
+        }
+        if self.node_statuses.get(&hash).unwrap() == &NodeStatus::Visited {
+            return Err(VisitError::NodeAlreadyVisited);
         }
 
         self.node_statuses.insert(hash, NodeStatus::Visited);
@@ -230,12 +253,21 @@ where
                 }
                 ParentDependencyType::All => {
                     // check if all parents are visited
-                    let parent_hashes = self.parent_dependencies.get(&child_hash).unwrap();
-                    let all_parent_hashes_visited = parent_hashes.iter().all(|&parent_hash| {
-                        self.node_statuses.get(&parent_hash).unwrap() == &NodeStatus::Visited
-                    });
-                    if all_parent_hashes_visited {
-                        self.ready_node_hashes.insert(*child_hash);
+                    match self.parent_dependencies.get(&child_hash) {
+                        Some(parent_hashes) => {
+                            let all_parent_hashes_visited =
+                                parent_hashes.iter().all(|&parent_hash| {
+                                    self.node_statuses.get(&parent_hash).unwrap()
+                                        == &NodeStatus::Visited
+                                });
+                            if all_parent_hashes_visited {
+                                self.ready_node_hashes.insert(*child_hash);
+                            }
+                        }
+                        None => {
+                            // this node has no parents, so it is ready to be visited
+                            self.ready_node_hashes.insert(*child_hash);
+                        }
                     }
                 }
             }
@@ -265,28 +297,29 @@ mod test {
     }
 
     #[test]
-    fn test_prepare() -> TestResult {
+    fn test_prepare_simple() -> TestResult {
         let mut sorter = TopologicalSorter::new();
-        sorter.insert("hello", ParentDependencyType::default())?;
-        let result = sorter.prepare();
-        assert!(result.is_ok());
-        sorter.prepared_state = super::PreparedState::Unprepared;
-
         sorter.insert("hello", ParentDependencyType::default())?;
         let result = sorter.prepare();
         assert!(result.is_ok());
 
         assert!(sorter.prepared_state == super::PreparedState::Prepared);
-        println!("ready_node_hashes: {:?}", sorter.ready_node_hashes);
         assert!(sorter.ready_node_hashes.len() == 1);
         let hash = sorter.hash(&"hello");
         assert!(sorter.ready_node_hashes.contains(&hash));
-        sorter.prepared_state = super::PreparedState::Unprepared;
+        Ok(())
+    }
 
+    #[test]
+    fn test_prepare_multiple_nodes() -> TestResult {
+        let mut sorter = TopologicalSorter::new();
+        sorter.insert("hello", ParentDependencyType::default())?;
         sorter.insert("world", ParentDependencyType::default())?;
         let result = sorter.prepare();
-        assert!(result.is_err());
-        assert!(sorter.prepared_state == super::PreparedState::Unprepared);
+        assert!(result.is_ok());
+
+        assert!(sorter.prepared_state == super::PreparedState::Prepared);
+        assert!(sorter.ready_node_hashes.len() == 2);
         Ok(())
     }
 
@@ -375,29 +408,31 @@ mod test {
         Ok(())
     }
 
-    // #[test]
-    // fn test_any_vs_all_parent_dependencies() -> TestResult {
-    //     let mut sorter = TopologicalSorter::new();
-    //     let hash = sorter.insert("hello", ParentDependencyType::default())?;
-    //     let any_parent_dep_child = sorter.insert("any_parent", ParentDependencyType::default())?;
+    #[test]
+    fn test_any_vs_all_parent_dependencies() -> TestResult {
+        let mut sorter = TopologicalSorter::new();
+        let parent_1 = sorter.insert("hello", ParentDependencyType::Any)?;
+        let parent_2 = sorter.insert("world", ParentDependencyType::All)?;
+        let any_parent_dep_child = sorter.insert("any_parent", ParentDependencyType::Any)?;
+        let all_parent_dep_child = sorter.insert("all_parent", ParentDependencyType::All)?;
 
-    //     sorter.add_dependencies(hash, &vec![child_hash])?;
+        sorter.add_dependencies(parent_1, &vec![all_parent_dep_child, any_parent_dep_child])?;
+        sorter.add_dependencies(parent_2, &vec![all_parent_dep_child, any_parent_dep_child])?;
 
-    //     sorter.prepare()?;
-    //     let ready_nodes = sorter.collect_ready_nodes()?;
-    //     assert!(ready_nodes.len() == 1);
-    //     let node = &ready_nodes[0];
-    //     sorter.mark_node_as_visited(node)?;
-    //     assert!(!sorter.is_finished());
+        sorter.prepare()?;
+        let ready_nodes = sorter.collect_ready_nodes()?;
+        assert!(ready_nodes.len() == 2);
 
-    //     let ready_nodes = sorter.collect_ready_nodes()?;
-    //     assert!(ready_nodes.len() == 1);
-    //     assert!(ready_nodes[0] == "world");
+        sorter.mark_node_as_visited(&ready_nodes[0])?;
+        let peeked_nodes = sorter.peek_ready_nodes()?;
+        assert!(peeked_nodes.len() == 1);
+        assert!(peeked_nodes[0] == &"any_parent");
 
-    //     let ready_nodes = sorter.collect_ready_nodes()?;
-    //     assert!(ready_nodes.is_empty());
-
-    //     assert!(sorter.is_finished());
-    //     Ok(())
-    // }
+        sorter.mark_node_as_visited(&ready_nodes[1])?;
+        let peeked_nodes = sorter.peek_ready_nodes()?;
+        assert!(peeked_nodes.len() == 2);
+        assert!(peeked_nodes.contains(&&"any_parent"));
+        assert!(peeked_nodes.contains(&&"all_parent"));
+        Ok(())
+    }
 }
